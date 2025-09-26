@@ -1,0 +1,3 @@
+openstacksdk
+python-zunclient
+git+https://github.com/chameleoncloud/python-blazarclient
