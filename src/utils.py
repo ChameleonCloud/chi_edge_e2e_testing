@@ -1,6 +1,8 @@
 import datetime
 import time
 from collections import defaultdict
+import logging
+LOG = logging.getLogger(__name__)
 
 
 def reserve_device(blazar, node_type, duration_hours=1):

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -16,12 +17,10 @@ from zunclient.v1.containers import Container
 import utils
 
 # Enable debug logging
-logging.basicConfig(
-    level=logging.INFO,
-    filename="output.log",
-    filemode="a",
-)
-openstack.enable_logging(debug=False)
+logging.basicConfig(level=logging.DEBUG)
+LOG = logging.getLogger(__name__)
+openstack.enable_logging(debug=False, http_debug=False)
+
 
 class RequestIdCapturingSession(object):
     def __init__(self, session: ksaSession) -> None:
@@ -83,7 +82,7 @@ class TestLaunchDeviceContainer(object):
             image="alpine",
             command=["sleep", "3600"],
             hints=hints,
-        ) # type: ignore
+        )  # type: ignore
         zun_t1 = time.perf_counter()
 
         self.container_create_elapsed = zun_t1 - zun_t0
@@ -97,42 +96,47 @@ class TestLaunchDeviceContainer(object):
         if wait_result:
             self.container = wait_result
         self.container_active_elapsed = zun_t2 - zun_t1
-        
 
-    def fip_stage(self)-> None:
-        port_id = None
-        
-        for _, addrs in self.container.addresses.items():
-            for addr in addrs:
+        # populate port and internal ip addr
+        # structure is dict of container "??" object
+        # each one has array of dicts
+        # addr
+        # version
+        # port
+        container_ifaces = self.container.addresses.items()
+        for _, address_dict_list in container_ifaces:
+            if len(address_dict_list) > 1:
+                LOG.warning(
+                    "More than 1 address on container! %s %s",
+                    self.container.uuid,
+                    address_dict_list,
+                )
+            for address_dict in address_dict_list:
                 # TODO: handle multiple addresses
-                port_id = addr.get("port")
+                self.container_port_id = address_dict.get("port")
+                self.container_ip_address = address_dict.get("addr")
 
-        if port_id is None:
-            raise Exception("No port found for container %s", self.container.id)
-        
-
+    def fip_stage(self) -> None:
         fip_t0 = time.perf_counter()
         floating_ip = self.conn.network.create_ip(
             floating_network_id="17446dec-0c72-4d28-abf5-99f43e152221",
-            port_id=port_id,
+            port_id=self.container_port_id,
         )
         fip_t1 = time.perf_counter()
         self.fip_create_elapsed = fip_t1 - fip_t0
 
-        floating_ip = utils.wait_for_fip_status(self.conn, fip_id = floating_ip.id, timeout = 300)
+        floating_ip = utils.wait_for_fip_status(
+            self.conn, fip_id=floating_ip.id, timeout=300
+        )
         fip_t2 = time.perf_counter()
-        self.fip_start_elapsed = fip_t2-fip_t1
+        self.fip_start_elapsed = fip_t2 - fip_t1
 
         self.fip_id = floating_ip.id
         self.fip_address = floating_ip.floating_ip_address
 
-
-    def ping_stage(self) -> None:
-
+    def ping_stage(self) -> bool:
         ping_t0 = time.perf_counter()
-        response = os.system(
-                f"ping -t 120 -o {self.fip_address} > /dev/null 2>&1"
-            )
+        response = os.system(f"ping -t 120 -o {self.fip_address} > /dev/null 2>&1")
         ping_t1 = time.perf_counter()
         self.ping_elapsed = ping_t1 - ping_t0
 
@@ -141,29 +145,67 @@ class TestLaunchDeviceContainer(object):
         else:
             self.ping_success = False
 
-    def cleanup(self):
+        return self.ping_success
 
+    def cleanup(self):
         self.conn.network.delete_ip(self.fip_id)
         self.blazar.lease.delete(self.lease_id)
-        
 
     def run_test(self) -> None:
         self.reservation_stage()
-        self.container_stage()
-        self.fip_stage()
+        LOG.info(
+            "Device %s; Lease %s, Reservation %s",
+            self.device_name,
+            self.lease_id,
+            self.reservation_id,
+        )
 
-        try:
-            self.ping_stage()
-        except Exception as e:
-            logging.warning("encountered exception: ", e)
+        self.container_stage()
+        LOG.info(
+            "Container id %s; fixed_ip %s, port_id %s",
+            self.container.uuid,
+            self.container_ip_address,
+            self.container_port_id,
+        )
+
+        self.fip_stage()
+        LOG.info("Bound floating IP %s %s", self.fip_address, self.fip_id)
+
+        if self.ping_stage():
+            LOG.info(
+                "Ping success to address %s on container %s device %s",
+                self.fip_address,
+                self.container.uuid,
+                self.device_name,
+            )
+            self.cleanup()
         else:
-            self.cleanup() 
+            LOG.warning(
+                "Ping Fail to address %s on container %s device %s",
+                self.fip_address,
+                self.container.uuid,
+                self.device_name,
+            )
+
+    def output_results(self) -> dict:
+        result = {
+            "lease_id": self.lease_id,
+            "reservation_id": self.reservation_id,
+            "device_id": self.device_id,
+            "device_name": self.device_name,
+            "container_id": self.container.uuid,
+            "port_id": self.container_port_id,
+            "fixed_addr": self.container_ip_address,
+            "fip_id": self.fip_id,
+            "fip_addr": self.fip_address,
+            "ping_success": self.ping_success,
+        }
+        return result
 
 
 def main():
     # Initialize connection to OpenStack
     conn = openstack.connect()
-
     # customize session with request logging
     wrapped_session = RequestIdCapturingSession(conn.session)
 
@@ -171,12 +213,12 @@ def main():
     blazar: BlazarV1Client = BlazarClient(session=wrapped_session)
     zun: ZunV1Client = ZunClient(session=wrapped_session)
 
-    testcase = TestLaunchDeviceContainer(conn, blazar, zun)
-    testcase.run_test()
-
-    print(testcase)
-
-   
+    while True:
+        testcase = TestLaunchDeviceContainer(conn, blazar, zun)
+        testcase.run_test()
+        # to write a new line
+        with open("results.jsonl", "a") as f:
+            f.write(json.dumps(testcase.output_results()) + "\n")
 
 
 if __name__ == "__main__":
