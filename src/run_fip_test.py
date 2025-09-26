@@ -1,23 +1,29 @@
-
-from typing import Any
-import openstack
+import logging
+import os
 import time
+from typing import Any
+
+import openstack
 from blazarclient.client import Client as BlazarClient
+from blazarclient.v1.client import Client as BlazarV1Client
+from keystoneauth1.session import Session as ksaSession
+from openstack.connection import Connection
 from requests import Response
 from zunclient.client import Client as ZunClient
+from zunclient.v1.client import Client as ZunV1Client
+from zunclient.v1.containers import Container
+
 import utils
-import os
-
-from keystoneauth1.session import Session as ksaSession
-
-import logging
 
 # Enable debug logging
-logging.basicConfig(level=logging.INFO, filename='output.log', filemode='a',)
+logging.basicConfig(
+    level=logging.INFO,
+    filename="output.log",
+    filemode="a",
+)
 openstack.enable_logging(debug=False)
 
 class RequestIdCapturingSession(object):
-
     def __init__(self, session: ksaSession) -> None:
         self._session = session
         self.last_request_id = None
@@ -27,10 +33,134 @@ class RequestIdCapturingSession(object):
 
     def request(self, *args, **kwargs) -> Response:
         response = self._session.request(*args, **kwargs)
-        self.last_request_id = response.headers.get('X-OpenStack-Request-ID')
+        self.last_request_id = response.headers.get("X-OpenStack-Request-ID")
         return response
 
-def run_test()  -> None: 
+
+class TestLaunchDeviceContainer(object):
+    def __init__(
+        self, conn: Connection, blazar: BlazarV1Client, zun: ZunV1Client
+    ) -> None:
+        self.conn = conn
+        self.blazar = blazar
+        self.zun = zun
+
+    def reservation_stage(self) -> None:
+        res_t0 = time.perf_counter()
+        lease = utils.reserve_device(
+            self.blazar, node_type="raspberrypi4-64", duration_hours=1
+        )
+        res_t1 = time.perf_counter()
+
+        self.lease_create_elapsed = res_t1 - res_t0
+        self.lease_id = lease["id"]
+
+        lease = utils.wait_for_lease_status(
+            blazar=self.blazar, lease_id=lease["id"], timeout=300
+        )
+        res_t2 = time.perf_counter()
+        self.lease_active_elapsed = res_t2 - res_t1
+
+        self.reservation_id = utils.get_device_reservation_id(lease)
+        devices_by_reservation_id = utils.get_devices_from_lease_id(
+            self.blazar, lease["id"]
+        )
+
+        devices = devices_by_reservation_id.get(self.reservation_id, [])
+        device = devices[0]  # assuming one device per reservation
+
+        self.device_id = device.get("id")
+        self.device_name = device.get("name")
+        self.device_type = device.get("machine_name")
+
+    def container_stage(self) -> None:
+        # get hint from reservation
+        hints = {"reservation": self.reservation_id}
+
+        zun_t0 = time.perf_counter()
+        self.container: Container = self.zun.containers.create(
+            name="test-container",
+            image="alpine",
+            command=["sleep", "3600"],
+            hints=hints,
+        ) # type: ignore
+        zun_t1 = time.perf_counter()
+
+        self.container_create_elapsed = zun_t1 - zun_t0
+
+        # wait for container to start
+        wait_result = utils.wait_for_container_status(
+            self.zun, self.container.uuid, desired_status="Running", timeout=300
+        )
+        zun_t2 = time.perf_counter()
+
+        if wait_result:
+            self.container = wait_result
+        self.container_active_elapsed = zun_t2 - zun_t1
+        
+
+    def fip_stage(self)-> None:
+        port_id = None
+        
+        for _, addrs in self.container.addresses.items():
+            for addr in addrs:
+                # TODO: handle multiple addresses
+                port_id = addr.get("port")
+
+        if port_id is None:
+            raise Exception("No port found for container %s", self.container.id)
+        
+
+        fip_t0 = time.perf_counter()
+        floating_ip = self.conn.network.create_ip(
+            floating_network_id="17446dec-0c72-4d28-abf5-99f43e152221",
+            port_id=port_id,
+        )
+        fip_t1 = time.perf_counter()
+        self.fip_create_elapsed = fip_t1 - fip_t0
+
+        floating_ip = utils.wait_for_fip_status(self.conn, fip_id = floating_ip.id, timeout = 300)
+        fip_t2 = time.perf_counter()
+        self.fip_start_elapsed = fip_t2-fip_t1
+
+        self.fip_id = floating_ip.id
+        self.fip_address = floating_ip.floating_ip_address
+
+
+    def ping_stage(self) -> None:
+
+        ping_t0 = time.perf_counter()
+        response = os.system(
+                f"ping -t 120 -o {self.fip_address} > /dev/null 2>&1"
+            )
+        ping_t1 = time.perf_counter()
+        self.ping_elapsed = ping_t1 - ping_t0
+
+        if response == 0:
+            self.ping_success = True
+        else:
+            self.ping_success = False
+
+    def cleanup(self):
+
+        self.conn.network.delete_ip(self.fip_id)
+        self.blazar.lease.delete(self.lease_id)
+        
+
+    def run_test(self) -> None:
+        self.reservation_stage()
+        self.container_stage()
+        self.fip_stage()
+
+        try:
+            self.ping_stage()
+        except Exception as e:
+            logging.warning("encountered exception: ", e)
+        else:
+            self.cleanup() 
+
+
+def main():
     # Initialize connection to OpenStack
     conn = openstack.connect()
 
@@ -38,109 +168,15 @@ def run_test()  -> None:
     wrapped_session = RequestIdCapturingSession(conn.session)
 
     # reserve a device
-    blazar = BlazarClient(session=wrapped_session)
-    zun = ZunClient(version='1', session=wrapped_session)
+    blazar: BlazarV1Client = BlazarClient(session=wrapped_session)
+    zun: ZunV1Client = ZunClient(session=wrapped_session)
 
-    res_t0 = time.perf_counter()
-    lease = utils.reserve_device(blazar, node_type="raspberrypi4-64", duration_hours=1)
-    res_t1 = time.perf_counter()
-    logging.info(f"Reserved device with lease ID {lease['id']} in {res_t1 - res_t0:.2f} seconds")
+    testcase = TestLaunchDeviceContainer(conn, blazar, zun)
+    testcase.run_test()
 
-    reservation_id = utils.get_device_reservation_id(lease)
-    reserved_devices = utils.get_devices_from_lease_id(blazar, lease['id'])
+    print(testcase)
 
-    for reservation_id, devices in reserved_devices.items():
-        for device in devices:
-            device_id = device.get("id")
-            device_hostname = device.get("name")
-            device_type = device.get("machine_name")
-            logging.info(f"Reservation ID: {reservation_id}, Device ID: {device_id}, Hostname: {device_hostname}, Type: {device_type}")
-
-    hints = {'reservation': reservation_id}
-    # launch container using reserved device
-
-
-    zun_t0 = time.perf_counter()
-    container = zun.containers.create(name='test-container',
-                                      image='alpine',
-                                      command=['sleep', '3600'],
-                                      hints=hints)
-    
-    zun_t1 = time.perf_counter()
-    logging.info(f"Created container {container.uuid} in {zun_t1 - zun_t0:.2f} seconds")
-
-    # wait for container to start
-    utils.wait_for_container_status(zun, container.uuid, desired_status='Running', timeout=300)
-    zun_t2 = time.perf_counter()
-    logging.info(f"Container {container.uuid} is running after {zun_t2 - zun_t1:.2f} seconds")
-
-
-    container_details = zun.containers.get(container.uuid)
-    port_id = None
-    for uuid, addrs in container_details.addresses.items():
-        for addr in addrs:
-            # TODO: handle multiple addresses
-            port_id = addr.get('port')
-
-    if port_id is not None:
-
-        fip_t0 = time.perf_counter()
-        # allocate floating IP
-        floating_ip = conn.network.create_ip(
-            floating_network_id='17446dec-0c72-4d28-abf5-99f43e152221',
-            port_id=port_id,
-        )
-        fip_t1 = time.perf_counter()
-        fip_create_elapsed = fip_t1 - fip_t0
-        logging.info(f"Associated floating IP {floating_ip.floating_ip_address} to fixed ip {floating_ip.fixed_ip_address} on container {container.uuid} in {fip_create_elapsed:.2f} seconds")
-
-        # wait for it to become active
-        while True:
-            floating_ip = conn.network.get_ip(floating_ip.id)
-            fip_t2 = time.perf_counter()
-            if floating_ip.status == 'ACTIVE':
-                logging.info(f"Floating IP {floating_ip.floating_ip_address} is active after {fip_t2 - fip_t1:.2f} seconds")
-                break
-            time.sleep(1)
-
-            if fip_t2 - fip_t1 > 60:
-                logging.info("Timeout waiting for floating IP to become active")
-                return
-            
-        # test connectivity
-        ping_t0 = time.perf_counter()
-
-        response = os.system(f"ping -t 120 -o {floating_ip.floating_ip_address} > /dev/null 2>&1")
-        ping_t1 = time.perf_counter()
-        ping_elapsed = ping_t1 - ping_t0
-        if response == 0:
-            logging.info(f"Ping to {floating_ip.floating_ip_address} successful in {ping_elapsed:.2f} seconds")
-        else:
-            logging.info(f"Ping to {floating_ip.floating_ip_address} failed at {ping_elapsed:.2f} seconds")
-
-
-    logging.info("cleaning up resources")
-
-    conn.network.delete_ip(floating_ip.id)
-
-    blazar.lease.delete(lease['id'])
-    #check if it still exists
-    try:
-        lease = blazar.lease.get(lease['id'])
-        logging.info("Lease still exists:", lease)
-    except Exception as e:
-        logging.info("Lease deleted successfully.")
-        pass
-
-def main():
-    while True:
-        try:
-            run_test()
-        except Exception as e:
-            logging.info("Error during test:", str(e))
-        
-        logging.info("starting next test")
-
+   
 
 
 if __name__ == "__main__":
