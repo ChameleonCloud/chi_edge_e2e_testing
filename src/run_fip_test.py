@@ -14,6 +14,8 @@ from zunclient.client import Client as ZunClient
 from zunclient.v1.client import Client as ZunV1Client
 from zunclient.v1.containers import Container
 
+import concurrent.futures
+import subprocess
 import utils
 
 # Enable debug logging
@@ -134,18 +136,25 @@ class TestLaunchDeviceContainer(object):
         self.fip_id = floating_ip.id
         self.fip_address = floating_ip.floating_ip_address
 
-    def ping_stage(self) -> bool:
+    def ping_stage(self, address_to_ping) -> bool:
         ping_t0 = time.perf_counter()
-        response = os.system(f"ping -t 120 -o {self.fip_address} > /dev/null 2>&1")
-        ping_t1 = time.perf_counter()
-        self.ping_elapsed = ping_t1 - ping_t0
 
-        if response == 0:
-            self.ping_success = True
-        else:
-            self.ping_success = False
+        while True:
+            args = ["ping", "-W1", "-c1", address_to_ping]
+            result = subprocess.run(args=args, capture_output=True)
 
-        return self.ping_success
+            ping_t1 = time.perf_counter()
+            ping_elapsed = ping_t1 - ping_t0
+
+            ping_success = False
+
+            if ping_elapsed > 120:
+                break
+            if result.returncode == 0:
+                ping_success = True
+                break
+            time.sleep(1)
+        return ping_success
 
     def cleanup(self):
         self.conn.network.delete_ip(self.fip_id)
@@ -171,21 +180,22 @@ class TestLaunchDeviceContainer(object):
         self.fip_stage()
         LOG.info("Bound floating IP %s %s", self.fip_address, self.fip_id)
 
-        if self.ping_stage():
-            LOG.info(
-                "Ping success to address %s on container %s device %s",
-                self.fip_address,
-                self.container.uuid,
-                self.device_name,
-            )
+        t0=time.perf_counter()
+        self.ping_fixed_result = self.ping_stage(self.container_ip_address)
+        self.ping_fixed_elapsed = time.perf_counter() - t0
+        LOG.info("ping to %s %s in %s", self.container_ip_address, self.ping_fixed_result, self.ping_fixed_elapsed )
+
+        t0=time.perf_counter()
+        self.ping_floating_result = self.ping_stage(self.fip_address)
+        self.ping_floating_elapsed = time.perf_counter() - t0
+
+        LOG.info("ping to %s %s in %s", self.fip_address, self.ping_floating_result, self.ping_floating_elapsed )
+
+        if self.ping_floating_result:
             self.cleanup()
         else:
-            LOG.warning(
-                "Ping Fail to address %s on container %s device %s",
-                self.fip_address,
-                self.container.uuid,
-                self.device_name,
-            )
+            LOG.warn("ping to fip failed, skipping cleanup")
+
 
     def output_results(self) -> dict:
         result = {
@@ -198,27 +208,50 @@ class TestLaunchDeviceContainer(object):
             "fixed_addr": self.container_ip_address,
             "fip_id": self.fip_id,
             "fip_addr": self.fip_address,
-            "ping_success": self.ping_success,
+            "ping_fixed_result": self.ping_fixed_result,
+            "ping_fixed_elapsed": self.ping_fixed_elapsed,
+            "ping_floating_result": self.ping_floating_result,
+            "ping_floating_elapsed": self.ping_floating_elapsed,
         }
         return result
 
 
-def main():
+def run_a_test():
     # Initialize connection to OpenStack
     conn = openstack.connect()
     # customize session with request logging
-    wrapped_session = RequestIdCapturingSession(conn.session)
+#    wrapped_session = RequestIdCapturingSession(conn.session)
 
     # reserve a device
-    blazar: BlazarV1Client = BlazarClient(session=wrapped_session)
-    zun: ZunV1Client = ZunClient(session=wrapped_session)
+    blazar: BlazarV1Client = BlazarClient(session=conn.session)
+    zun: ZunV1Client = ZunClient(session=conn.session)
 
-    while True:
-        testcase = TestLaunchDeviceContainer(conn, blazar, zun)
+    testcase = TestLaunchDeviceContainer(conn, blazar, zun)
+
+    try:
         testcase.run_test()
-        # to write a new line
-        with open("results.jsonl", "a") as f:
-            f.write(json.dumps(testcase.output_results()) + "\n")
+    except Exception as ex:
+        raise(ex)
+    else:
+        return testcase.output_results()
+
+def main():
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = []
+        for i in range(1,500):
+            futures.append(executor.submit(run_a_test))
+        for future in futures:
+            try:
+                data = future.result()
+            except Exception as exc:
+                LOG.warning(exc)
+            else:
+                with open("results.jsonl", "a") as f:
+                    f.write(json.dumps(data) + "\n")
+
+
+
 
 
 if __name__ == "__main__":
